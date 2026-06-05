@@ -1,0 +1,401 @@
+--- sing-box.sh.orig	2026-06-05 07:52:41.166962944 +0000
++++ sing-box.sh	2026-06-05 07:55:27.302364614 +0000
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env bash
+ 
+ # 当前脚本版本号
+-VERSION='v1.3.14-safe1 (2026.06.04, security-hardened)'
++VERSION='v1.3.14-safe2-production (2026.06.05, official-sha256-local-rules)'
+ 
+ # Github 反代加速代理
+ GITHUB_PROXY=()
+@@ -22,7 +22,10 @@
+ CONSECUTIVE_PORTS=${#PROTOCOL_LIST[@]}
+ CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cfip.xxxxxxxx.tk" "bestcf.top" "cdn.2020111.xyz" "xn--b6gac.eu.org" "cf.090227.xyz")
+ SUBSCRIBE_TEMPLATE='local-embedded'
+-DEFAULT_NEWEST_VERSION='1.13.0-rc.4'
++DEFAULT_NEWEST_VERSION='1.13.13'
++PINNED_SING_BOX_VERSION='1.13.13'
++PINNED_CLOUDFLARED_VERSION='2026.5.2'
++PINNED_JQ_VERSION='1.8.1'
+ STEP_NUM=0      # 当前步骤编号（安装流程中动态递增）
+ TOTAL_STEPS=''  # 总步骤数（协议确定后动态计算）
+ 
+@@ -37,6 +40,73 @@
+ 
+ mkdir -p "$TEMP_DIR"
+ 
++
++# Production security hardening: all runtime binaries are downloaded only from official
++# GitHub Releases, with pinned versions and embedded SHA256 hashes. Any mismatch aborts.
++get_embedded_sha256() {
++  local ASSET="$1"
++  case "$ASSET" in
++    sing-box-1.13.13-linux-amd64.tar.gz)        echo 'd7d35b806db72ecfb3021a2148ab72f03e8af0baa5067a85d5573888574fd890' ;;
++    sing-box-1.13.13-linux-amd64-glibc.tar.gz)  echo '9834f44290e21b7957e11c1c354c90ee8473b221f2c875256b0076598b7142d4' ;;
++    sing-box-1.13.13-linux-amd64-musl.tar.gz)   echo 'd95d8e71b7b8574ef575414117cbb221c05d3ba71142c2226661357ffe846189' ;;
++    sing-box-1.13.13-linux-arm64.tar.gz)        echo '6c464f835f136d140d7dcae0a9641ab7a38fbc3e59a2d8860644d11af4d4d6a1' ;;
++    sing-box-1.13.13-linux-arm64-glibc.tar.gz)  echo 'f0cc5c6532d0763de148fe7797cf76d0343063ce1148530c94e912c790b17cc9' ;;
++    sing-box-1.13.13-linux-arm64-musl.tar.gz)   echo '437f3d8079cfd3d9ebce8332cc6feabafcdb3af27d376ef5e64051fce16399ed' ;;
++    sing-box-1.13.13-linux-armv7.tar.gz)        echo 'bc267458391df9260e7d90f9aee8ff04a86d5039a870fdb853e3eef03bec96fc' ;;
++    sing-box-1.13.13-linux-armv7-glibc.tar.gz)  echo '6f9e2642b282ac1a554b5890247a5f4c05d8a33611cd26db654ed593fc957607' ;;
++    sing-box-1.13.13-linux-armv7-musl.tar.gz)   echo '6caa24bc2189bdfb3150a41b451b39261c642711b7a6ac3b8e46b396f1fea67b' ;;
++    cloudflared-linux-amd64) echo '5286698547f03df745adb2355f04c12dde52ef425491e81f433642d695521886' ;;
++    cloudflared-linux-arm64) echo '5a4e8ce2701105271412059f44b6a0bf1ae4542b4d98ff3180c0c019443a5815' ;;
++    cloudflared-linux-arm)   echo '70a4c869a037bd69af6ce2ad0c4da4a7680d94fcfb8d4c70ecddae24d560762f' ;;
++    cloudflared-linux-armhf) echo '190152c373f608080eb6aa9e2aad395f88398dfb9efd0f9b064e2652cffcefdd' ;;
++    jq-linux-amd64) echo '020468de7539ce70ef1bceaf7cde2e8c4f2ca6c3afb84642aabc5c97d9fc2a0d' ;;
++    jq-linux-arm64) echo '6bc62f25981328edd3cfcfe6fe51b073f2d7e7710d7ef7fcdac28d4e384fc3d4' ;;
++    jq-linux-armhf) echo 'ac304e50cf7cd24933d83dc7d0e4f79892a71a92fb02336d4ecaffa8933760bd' ;;
++    *) return 1 ;;
++  esac
++}
++
++secure_download_with_sha256() {
++  local URL="$1" OUT="$2" ASSET="$3" EXPECTED
++  EXPECTED=$(get_embedded_sha256 "$ASSET") || error "\n Missing embedded SHA256 for $ASSET. Refusing to install. \n"
++  case "$URL" in
++    https://github.com/SagerNet/sing-box/releases/download/*|https://github.com/cloudflare/cloudflared/releases/download/*|https://github.com/jqlang/jq/releases/download/*) ;;
++    *) error "\n Unapproved binary download URL: $URL \n" ;;
++  esac
++  rm -f "$OUT"
++  if command -v wget >/dev/null 2>&1; then
++    wget --https-only --secure-protocol=TLSv1_2 --tries=3 --timeout=30 -qO "$OUT" "$URL" || error "\n Download failed: $ASSET \n"
++  elif command -v curl >/dev/null 2>&1; then
++    curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 120 "$URL" -o "$OUT" || error "\n Download failed: $ASSET \n"
++  else
++    error "\n Neither wget nor curl is available. \n"
++  fi
++  echo "${EXPECTED}  ${OUT}" | sha256sum -c - >/dev/null 2>&1 || { rm -f "$OUT"; error "\n SHA256 verification failed for $ASSET. Installation aborted. \n"; }
++}
++
++secure_install_sing_box_to_temp() {
++  local ASSET="sing-box-${PINNED_SING_BOX_VERSION}-linux-${SING_BOX_ARCH}.tar.gz"
++  local ARCHIVE="${TEMP_DIR}/${ASSET}" SB_DIR="${TEMP_DIR}/sing-box-${PINNED_SING_BOX_VERSION}-linux-${SING_BOX_ARCH}"
++  secure_download_with_sha256 "https://github.com/SagerNet/sing-box/releases/download/v${PINNED_SING_BOX_VERSION}/${ASSET}" "$ARCHIVE" "$ASSET"
++  rm -rf "$SB_DIR" "$TEMP_DIR/sing-box"
++  tar xzf "$ARCHIVE" -C "$TEMP_DIR" "$SB_DIR/sing-box" 2>/dev/null || error "\n Failed to extract verified sing-box archive. \n"
++  [ -s "$SB_DIR/sing-box" ] || error "\n sing-box binary missing after extraction. \n"
++  mv "$SB_DIR/sing-box" "$TEMP_DIR/sing-box"
++  chmod +x "$TEMP_DIR/sing-box"
++}
++
++secure_install_jq_to_temp() {
++  local ASSET="jq-linux-${JQ_ARCH}"
++  secure_download_with_sha256 "https://github.com/jqlang/jq/releases/download/jq-${PINNED_JQ_VERSION}/${ASSET}" "$TEMP_DIR/jq" "$ASSET"
++  chmod +x "$TEMP_DIR/jq"
++}
++
++secure_install_cloudflared_to_temp() {
++  local ASSET="cloudflared-linux-${ARGO_ARCH}"
++  secure_download_with_sha256 "https://github.com/cloudflare/cloudflared/releases/download/${PINNED_CLOUDFLARED_VERSION}/${ASSET}" "$TEMP_DIR/cloudflared" "$ASSET"
++  chmod +x "$TEMP_DIR/cloudflared"
++}
++
+ E[0]="Language:\n 1. English (default) \n 2. 简体中文"
+ C[0]="${E[0]}"
+ E[1]="1. Added optional custom warp route rule management, available after installation via [sb -d] without affecting the main installation flow; 2. Added Hysteria2 Realm support for machines without public inbound access, with optional WARP-assisted hole punching"
+@@ -135,8 +205,8 @@
+ C[47]="没有 server ip，脚本退出，问题反馈:[https://github.com/fscarmen/sing-box/issues]"
+ E[48]="ShadowTLS - Copy the above two Neko links and manually set up the chained proxies in order. Tutorial: https://github.com/fscarmen/sing-box/blob/main/README.md#sekobox-%E8%AE%BE%E7%BD%AE-shadowtls-%E6%96%B9%E6%B3%95"
+ C[48]="ShadowTLS - 复制上面两条 Neko links 进去，并按顺序手动设置链式代理，详细教程: https://github.com/fscarmen/sing-box/blob/main/README.md#sekobox-%E8%AE%BE%E7%BD%AE-shadowtls-%E6%96%B9%E6%B3%95"
+-E[49]="Select more protocols to install (e.g. hgbd). The order of the port numbers of the protocols is related to the ordering of the multiple choices:\n a. all (default)"
+-C[49]="多选需要安装协议(比如 hgbd)，协议的端口号次序与多选的排序有关:\n a. all (默认)"
++E[49]="Select protocol(s) to install (e.g. h or hc). For production stability, pressing Enter / a uses VMess + WS only. Advanced protocols should be added one by one after installation:\n a. stable default (VMess + WS)"
++C[49]="选择需要安装的协议(比如 h 或 hc)，协议端口号次序与选择排序有关。生产稳定优先，直接回车 / a 只安装 VMess + WS，高级协议建议安装后逐个递加:\n a. 稳定默认 (VMess + WS)"
+ E[50]="Please enter the \$TYPE domain name:"
+ C[50]="请输入 \$TYPE 域名:"
+ E[51]="Please choose or custom a cdn, http support is required:"
+@@ -347,8 +417,8 @@
+ C[154]="输入规则集名称 (逗号分隔，如 geosite-google,geosite-telegram):"
+ E[155]="Matched custom route rules will use warp-ep outbound."
+ C[155]="命中的自定义路由规则将使用 warp-ep 出站。"
+-E[156]="Rule set \"\${RULE_NAME}\" not found in SagerNet or MetaCubeX repositories. Please re-enter:"
+-C[156]="规则集 \"\${RULE_NAME}\" 在 SagerNet 和 MetaCubeX 仓库中均未找到，请重新输入:"
++E[156]="Local built-in rule set \"\${RULE_NAME}\" is not available. Supported: openai, gemini, claude, google, youtube, telegram, netflix, discord, github, twitter."
++C[156]="本地内置规则集 \"\${RULE_NAME}\" 不可用。支持: openai, gemini, claude, google, youtube, telegram, netflix, discord, github, twitter。"
+ E[157]="Custom route rule added successfully."
+ C[157]="自定义路由规则添加成功。"
+ E[158]="No custom route rules configured."
+@@ -359,8 +429,8 @@
+ C[160]="自定义路由规则已删除。"
+ E[161]="Invalid domain format: \${DOMAIN}"
+ C[161]="无效的域名格式: \${DOMAIN}"
+-E[162]="API check failed, using SagerNet URL as default. (Warning: rule_set may not exist)"
+-C[162]="API 校验失败，默认使用 SagerNet 地址。(警告: 规则集可能不存在)"
++E[162]="Remote API rule-set check is disabled in production-local build."
++C[162]="生产本地化版本已禁用远程 API 规则集检查。"
+ E[163]="Current custom route rules:"
+ C[163]="当前自定义路由规则:"
+ 
+@@ -507,61 +577,9 @@
+   TOTAL_STEPS=$_total
+ }
+ 
+-# 检测是否需要启用 Github CDN，如能直接连通 api.github.com，则不使用
++# 生产安全版禁用第三方 GitHub 反代，不做外部 API 探测
+ check_cdn() {
+-  local PROXY CODE PID CMD
+-  local _WAIT_COUNT=120
+-  local PIDS=()
+-  local API_URL='https://api.github.com/repos/SagerNet/sing-box/releases'
+-
+-  # 确定下载工具：优先 wget，次选 curl
+-  if command -v wget >/dev/null 2>&1; then
+-    CMD='wget'
+-  elif command -v curl >/dev/null 2>&1; then
+-    CMD='curl'
+-  else
+-    GH_PROXY=''
+-    return
+-  fi
+-
+-  # 获取 HTTP 状态码
+-  get_code() {
+-    local url=$1
+-    if [ "$CMD" = 'wget' ]; then
+-      wget -qT5 -O /dev/null --server-response "$url" 2>&1 | awk '/HTTP\//{code=$2} END{print code}'
+-    else
+-      curl -sL -w "%{http_code}" "$url" -o /dev/null
+-    fi
+-  }
+-
+-  # 直连检测
+-  CODE=$(get_code "$API_URL")
+-  if [ "$CODE" = '200' ]; then
+-    GH_PROXY=''
+-    return
+-  fi
+-
+-  # 并发探测代理
+-  for PROXY in "${GITHUB_PROXY[@]}"; do
+-    {
+-      CODE=$(get_code "${PROXY}${API_URL}")
+-      [ "$CODE" = '200' ] && [ ! -e "${TEMP_DIR}/cdn_proxy" ] && printf '%s' "$PROXY" > "${TEMP_DIR}/cdn_proxy"
+-    } &
+-    PIDS+=("$!")
+-  done
+-
+-  # 等第一个返回 200 的代理，超时则回退为直连，避免无限等待卡死
+-  while [ ! -e "${TEMP_DIR}/cdn_proxy" ] && [ "$_WAIT_COUNT" -gt 0 ]; do
+-    sleep 0.05
+-    (( _WAIT_COUNT-- )) || true
+-  done
+-
+-  [ -e "${TEMP_DIR}/cdn_proxy" ] && GH_PROXY=$(cat "${TEMP_DIR}/cdn_proxy") || GH_PROXY=''
+-
+-  # 清理后台任务和临时文件
+-  for PID in "${PIDS[@]}"; do kill "$PID" >/dev/null 2>&1 || true; done
+-  for PID in "${PIDS[@]}"; do wait "$PID" 2>/dev/null || true; done
+-  rm -f "${TEMP_DIR}/cdn_proxy"
++  GH_PROXY=''
+ }
+ 
+ # 检测是否解锁 chatGPT，以决定是否使用 warp 链式代理或者是 direct out，此处判断改编自 https://github.com/lmc999/RegionRestrictionCheck
+@@ -1326,51 +1344,23 @@
+   ' "$CUSTOM_FILE" > "$TMP_FILE" && mv "$TMP_FILE" "$CUSTOM_FILE"
+ }
+ 
+-# 通过 GitHub API 校验 rule_set 是否存在，返回下载 URL
+-# 参数: $1 = rule_set 名称（不含 .srs）
+-# 输出: 下载 URL 或空字符串
+-check_rule_set_exists() {
+-  local NAME="$1"
+-  local SRS_NAME="${NAME}.srs"
+-  local CACHE_DIR="${TEMP_DIR}/ruleset_cache"
+-  mkdir -p "$CACHE_DIR"
+-
+-  # SagerNet 源
+-  local SAGERNET_CACHE="${CACHE_DIR}/sagernet_tree.json"
+-  if [ ! -s "$SAGERNET_CACHE" ]; then
+-    curl -sL --connect-timeout 5 --max-time 15 "https://api.github.com/repos/SagerNet/sing-geosite/git/trees/rule-set?recursive=1" > "$SAGERNET_CACHE" 2>/dev/null || true
+-  fi
+-
+-  if [ -s "$SAGERNET_CACHE" ] && jq_exec -e ".tree[]? | select(.path == \"${SRS_NAME}\")" "$SAGERNET_CACHE" >/dev/null 2>&1; then
+-    echo "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/${SRS_NAME}"
+-    return 0
+-  fi
+-
+-  # MetaCubeX 源
+-  local METACUBEX_CACHE="${CACHE_DIR}/metacubex_tree.json"
+-  if [ ! -s "$METACUBEX_CACHE" ]; then
+-    curl -sL --connect-timeout 5 --max-time 15 "https://api.github.com/repos/MetaCubeX/meta-rules-dat/git/trees/sing?recursive=1" > "$METACUBEX_CACHE" 2>/dev/null || true
+-  fi
+-
+-  if [ -s "$METACUBEX_CACHE" ]; then
+-    local MATCH_PATH
+-    MATCH_PATH=$(jq_exec -r "[.tree[]? | select(.path | endswith(\"/${SRS_NAME}\") or . == \"${SRS_NAME}\") | .path] | first // empty" "$METACUBEX_CACHE" 2>/dev/null)
+-    if [ -n "$MATCH_PATH" ]; then
+-      echo "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/${MATCH_PATH}"
+-      return 0
+-    fi
+-  fi
+-
+-  # 两处 API 都没数据（可能是 rate limit 或网络问题）
+-  if [ ! -s "$SAGERNET_CACHE" ] && [ ! -s "$METACUBEX_CACHE" ]; then
+-    # API 不可用，降级使用默认 URL
+-    warning " $(text 162) "
+-    echo "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/${SRS_NAME}"
+-    return 0
+-  fi
+-
+-  # 确实在两处都没找到
+-  return 1
++# 本地化 WARP 自定义路由规则：不再查询 SagerNet / MetaCubeX GitHub API，也不再下载远程 .srs。
++get_local_rule_set_domains() {
++  local NAME="${1,,}"
++  NAME=$(sed -E 's#^.*/##; s/\.srs$//I' <<< "$NAME")
++  case "$NAME" in
++    openai|geosite-openai) echo 'openai.com,chatgpt.com,oaistatic.com,oaiusercontent.com,auth0.openai.com,platform.openai.com,ios.chat.openai.com' ;;
++    gemini|geosite-gemini|google-gemini) echo 'gemini.google.com,ai.google.dev,generativelanguage.googleapis.com,bard.google.com' ;;
++    claude|geosite-claude|anthropic) echo 'anthropic.com,claude.ai,console.anthropic.com' ;;
++    google|geosite-google) echo 'google.com,googleapis.com,gstatic.com,googleusercontent.com,ggpht.com,googlevideo.com,youtube.com,ytimg.com' ;;
++    youtube|geosite-youtube) echo 'youtube.com,googlevideo.com,ytimg.com,youtu.be' ;;
++    telegram|geosite-telegram) echo 'telegram.org,t.me,tdesktop.com,telegra.ph' ;;
++    netflix|geosite-netflix) echo 'netflix.com,netflix.net,nflxext.com,nflximg.com,nflxvideo.net,nflxso.net' ;;
++    discord|geosite-discord) echo 'discord.com,discordapp.com,discord.gg,discord.media,discordcdn.com' ;;
++    github|geosite-github) echo 'github.com,githubusercontent.com,githubassets.com,github.io' ;;
++    twitter|x|geosite-twitter) echo 'twitter.com,x.com,t.co,twimg.com' ;;
++    *) return 1 ;;
++  esac
+ }
+ 
+ # 添加自定义路由规则
+@@ -1407,43 +1397,25 @@
+     [ "${#VALIDATED_VALUES[@]}" -eq 0 ] && warning " $(text 135) " && return
+ 
+   elif [ "$RULE_TYPE" = "rule_set" ]; then
+-    # 输入规则集名称
++    # 生产本地化版：rule_set 名称转换为内置 domain_suffix，不下载远程 .srs，不查询 GitHub API。
+     reading " $(text 154) " RULESET_INPUT
+     [ -z "$RULESET_INPUT" ] && info " $(text 135) " && return
+ 
+     local RULESETS=()
+     custom_route_csv_to_array "$RULESET_INPUT" RULESETS
+ 
+-    local RULE_NAME RETRY URL
++    local RULE_NAME LOCAL_DOMAINS DOMAIN
+     for RULE_NAME in "${RULESETS[@]}"; do
+       RULE_NAME="${RULE_NAME,,}"
+       RULE_NAME=$(sed -E 's#^.*/##; s/\.srs$//I' <<< "$RULE_NAME")
+       [[ -n "$RULE_NAME" && ! "$RULE_NAME" =~ ^geo(site|ip)- ]] && RULE_NAME="geosite-${RULE_NAME}"
+       [ -z "$RULE_NAME" ] && continue
+-
+-      RETRY=3
+-      URL=""
+-      while [ $RETRY -gt 0 ]; do
+-        URL=$(check_rule_set_exists "$RULE_NAME")
+-        if [ -n "$URL" ]; then
+-          VALIDATED_VALUES+=("$RULE_NAME")
+-          RULE_SET_URLS+=("$URL")
+-          break
+-        else
+-          ((RETRY--))
+-          if [ $RETRY -gt 0 ]; then
+-            warning " $(text 156) "
+-            reading " " RULE_NAME
+-            RULE_NAME="${RULE_NAME,,}"
+-            RULE_NAME=$(sed -E 's#^.*/##; s/\.srs$//I' <<< "$RULE_NAME")
+-            [[ -n "$RULE_NAME" && ! "$RULE_NAME" =~ ^geo(site|ip)- ]] && RULE_NAME="geosite-${RULE_NAME}"
+-          else
+-            warning " $(text 156) "
+-          fi
+-        fi
+-      done
++      LOCAL_DOMAINS=$(get_local_rule_set_domains "$RULE_NAME") || { warning " $(text 156) "; continue; }
++      IFS=',' read -r -a _LOCAL_DOMAIN_ARRAY <<< "$LOCAL_DOMAINS"
++      for DOMAIN in "${_LOCAL_DOMAIN_ARRAY[@]}"; do [ -n "$DOMAIN" ] && VALIDATED_VALUES+=("$DOMAIN"); done
+     done
+     [ "${#VALIDATED_VALUES[@]}" -eq 0 ] && warning " $(text 135) " && return
++    RULE_TYPE="domain_suffix"
+   fi
+ 
+   # 自定义路由固定使用 warp-ep 出站
+@@ -1944,20 +1916,12 @@
+   if [ "${STATUS[0]}" = "$(text 26)" ] && [ ! -s ${WORK_DIR}/sing-box ]; then
+     # 任务 1: 下载 sing-box
+     {
+-      local ONLINE=$(get_sing_box_version)
+-      local SB_DIR="$TEMP_DIR/sing-box-$ONLINE-linux-$SING_BOX_ARCH"
+-      local SB_BIN="$SB_DIR/sing-box"
+-      wget --continue \
+-        ${GH_PROXY}https://github.com/SagerNet/sing-box/releases/download/v$ONLINE/sing-box-$ONLINE-linux-$SING_BOX_ARCH.tar.gz \
+-        -qO- | tar xz -C $TEMP_DIR 2>/dev/null
+-      [ -s "$SB_BIN" ] && [ -x "$SB_BIN" ] && mv "$SB_BIN" "$TEMP_DIR/sing-box" && chmod +x "$TEMP_DIR/sing-box"
++      secure_install_sing_box_to_temp
+     } &
+ 
+     # 任务 2: 下载 jq
+     {
+-      wget --continue -qO $TEMP_DIR/jq \
+-        ${GH_PROXY}https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-$JQ_ARCH 2>/dev/null \
+-        && chmod +x $TEMP_DIR/jq
++      secure_install_jq_to_temp
+     } &
+ 
+     # 任务 3: 本地二维码包装器已由 write_local_subscribe_templates 生成
+@@ -2008,7 +1972,7 @@
+   # 如果有需要，后台静默下载 cloudflared
+   if [[ "${STATUS[1]}" = "$(text 26)" || "$NONINTERACTIVE_INSTALL" = 'noninteractive_install' ]] && [ ! -s ${WORK_DIR}/cloudflared ]; then
+     {
+-      wget -qO $TEMP_DIR/cloudflared ${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARGO_ARCH >/dev/null 2>&1 && chmod +x $TEMP_DIR/cloudflared >/dev/null 2>&1
++      secure_install_cloudflared_to_temp
+     }&
+   elif [ "${STATUS[1]}" != "$(text 26)" ]; then
+     # 查 Argo 进程号，运行时长和内存占用
+@@ -2158,21 +2122,7 @@
+ 
+ # 获取 sing-box 最新版本
+ get_sing_box_version() {
+-  # FORCE_VERSION 用于在 sing-box 某个主程序出现 bug 时，强制为指定版本，以防止运行出错
+-  local FORCE_VERSION=$(wget --tries=2 --timeout=3 -qO- ${GH_PROXY}https://raw.githubusercontent.com/fscarmen/sing-box/refs/heads/main/force_version | sed 's/^[vV]//g; s/\r//g')
+-  if grep -q '.' <<< "$FORCE_VERSION"; then
+-    local RESULT_VERSION="$FORCE_VERSION"
+-  else
+-    # 先判断 github api 返回 http 状态码是否为 200，有时候 IP 会被限制，导致获取不到最新版本
+-    local API_RESPONSE=$(wget --server-response --tries=2 --timeout=3 -qO- "${GH_PROXY}https://api.github.com/repos/SagerNet/sing-box/releases" 2>&1 | grep -E '^[ ]+HTTP/|tag_name')
+-    if grep -q 'HTTP.* 200' <<< "$API_RESPONSE"; then
+-      local VERSION_LATEST=$(awk -F '["v-]' '/tag_name/{print $5}' <<< "$API_RESPONSE" | sort -Vr | sed -n '1p')
+-      local RESULT_VERSION=$(wget --tries=2 --timeout=3 -qO- ${GH_PROXY}https://api.github.com/repos/SagerNet/sing-box/releases | awk -F '["v]' -v var="tag_name.*$VERSION_LATEST" '$0 ~ var {print $5; exit}')
+-    else
+-      local RESULT_VERSION="$DEFAULT_NEWEST_VERSION"
+-    fi
+-  fi
+-  echo "$RESULT_VERSION"
++  echo "${PINNED_SING_BOX_VERSION}"
+ }
+ 
+ # 添加端口跳跃
+@@ -4396,6 +4346,11 @@
+   [ ! -d ${TEMP_DIR} ] && mkdir -p $TEMP_DIR
+   ssl_certificate $TLS_SERVER_DEFAULT
+   hint "\n $(text 2) " && wait
++  [ -s "$TEMP_DIR/sing-box" ] || error "\n Verified sing-box binary is missing. Installation aborted. \n"
++  [ -s "$TEMP_DIR/jq" ] || error "\n Verified jq binary is missing. Installation aborted. \n"
++  if [ -n "$ARGO_RUNS" ]; then
++    [ -s "$TEMP_DIR/cloudflared" ] || error "\n Verified cloudflared binary is missing. Installation aborted. \n"
++  fi
+   sing-box_json
+   echo "${L^^}" > ${WORK_DIR}/language
+   cp $TEMP_DIR/sing-box $TEMP_DIR/jq ${WORK_DIR}
+@@ -5605,9 +5560,9 @@
+ 
+   if [ "${UPDATE,,}" = 'y' ]; then
+     check_system_info
+-    wget --continue ${GH_PROXY}https://github.com/SagerNet/sing-box/releases/download/v$ONLINE/sing-box-$ONLINE-linux-$SING_BOX_ARCH.tar.gz -qO- | tar xz -C $TEMP_DIR sing-box-$ONLINE-linux-$SING_BOX_ARCH/sing-box
++    secure_install_sing_box_to_temp
+ 
+-    if [ -s $TEMP_DIR/sing-box-$ONLINE-linux-$SING_BOX_ARCH/sing-box ]; then
++    if [ -s $TEMP_DIR/sing-box ]; then
+       cmd_systemctl disable sing-box
+ 
+       # 备份旧版本
+@@ -5615,7 +5570,7 @@
+       hint "\n $(text 102) \n"
+ 
+       # 安装新版本
+-      chmod +x $TEMP_DIR/sing-box-$ONLINE-linux-$SING_BOX_ARCH/sing-box && mv $TEMP_DIR/sing-box-$ONLINE-linux-$SING_BOX_ARCH/sing-box ${WORK_DIR}/sing-box
++      chmod +x $TEMP_DIR/sing-box && mv $TEMP_DIR/sing-box ${WORK_DIR}/sing-box
+       cmd_systemctl enable sing-box
+       sleep 2
+ 
