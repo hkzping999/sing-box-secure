@@ -3,8 +3,6 @@
 # 当前脚本版本号
 VERSION='v1.3.14-safe1 (2026.06.04, security-hardened)'
 
-# Github 反代加速代理
-GITHUB_PROXY=()
 
 # 各变量默认值
 TEMP_DIR='/tmp/sing-box'
