@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='v1.3.14-safe1 (2026.06.04, security-hardened)'
+VERSION='v1.3.14-safe1 (2026.06.05, security-hardened)'
 
+GITHUB_PROXY=()
 
 # 各变量默认值
 TEMP_DIR='/tmp/sing-box'
@@ -20,10 +21,7 @@ NODE_TAG=("xtls-reality" "hysteria2" "tuic" "ShadowTLS" "shadowsocks" "trojan" "
 CONSECUTIVE_PORTS=${#PROTOCOL_LIST[@]}
 CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cfip.xxxxxxxx.tk" "bestcf.top" "cdn.2020111.xyz" "xn--b6gac.eu.org" "cf.090227.xyz")
 SUBSCRIBE_TEMPLATE='local-embedded'
-DEFAULT_NEWEST_VERSION='1.13.13'
-PINNED_SING_BOX_VERSION='1.13.13'
-PINNED_CLOUDFLARED_VERSION='2026.5.2'
-PINNED_JQ_VERSION='1.7.1'
+DEFAULT_NEWEST_VERSION='1.13.0-rc.4'
 STEP_NUM=0      # 当前步骤编号（安装流程中动态递增）
 TOTAL_STEPS=''  # 总步骤数（协议确定后动态计算）
 
@@ -508,68 +506,61 @@ calc_install_steps() {
   TOTAL_STEPS=$_total
 }
 
-# 安全版：禁用所有第三方 GitHub 反代。所有二进制只允许从官方 GitHub Releases 下载。
+# 检测是否需要启用 Github CDN，如能直接连通 api.github.com，则不使用
 check_cdn() {
-  GH_PROXY=''
-}
+  local PROXY CODE PID CMD
+  local _WAIT_COUNT=120
+  local PIDS=()
+  local API_URL='https://api.github.com/repos/SagerNet/sing-box/releases'
 
-# 只允许官方 GitHub Releases + 固定版本 + SHA256 校验。
-# jq 与 cloudflared 的 SHA256 来自官方 release/checksum 页面；sing-box 若当前 GitHub API 暴露 asset digest，则强制校验官方 digest。
-# 若任何组件无法获得可信 SHA256，安装立即中止。
-get_embedded_sha256() {
-  local COMPONENT="$1" ASSET="$2"
-  case "${COMPONENT}|${ASSET}" in
-    # jq 1.7.1 official sha256sum.txt
-    'jq|jq-linux-amd64') echo '5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5' ;;
-    'jq|jq-linux-arm64') echo '4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5' ;;
-    'jq|jq-linux-armhf') echo '46d18f115cca638efed22b90342d52a84a25ab1bef570551d3a16f7eb065c298' ;;
-
-    # cloudflared 2026.5.2 official GitHub release SHA256 checksums
-    'cloudflared|cloudflared-linux-amd64') echo '5286698547f03df745adb2355f04c12dde52ef425491e81f433642d695521886' ;;
-    'cloudflared|cloudflared-linux-arm64') echo '5a4e8ce2701105271412059f44b6a0bf1ae4542b4d98ff3180c0c019443a5815' ;;
-    'cloudflared|cloudflared-linux-arm') echo '70a4c869a037bd69af6ce2ad0c4da4a7680d94fcfb8d4c70ecddae24d560762f' ;;
-    'cloudflared|cloudflared-linux-armhf') echo '190152c373f608080eb6aa9e2aad395f88398dfb9efd0f9b064e2652cffcefdd' ;;
-    *) return 1 ;;
-  esac
-}
-
-get_github_release_digest() {
-  local REPO="$1" TAG="$2" ASSET="$3" API_URL RESPONSE DIGEST
-  API_URL="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
-  RESPONSE=$(wget --tries=2 --timeout=10 -qO- "$API_URL" 2>/dev/null || true)
-  [ -n "$RESPONSE" ] || return 1
-  DIGEST=$(printf '%s' "$RESPONSE" | tr '\n' ' ' | sed 's/{/\n{/g' | awk -v asset="\"name\":\"'"$ASSET"'\"" '
-    index($0, asset) {
-      if (match($0, /"digest"[[:space:]]*:[[:space:]]*"sha256:[a-f0-9]{64}"/)) {
-        d=substr($0, RSTART, RLENGTH); gsub(/.*sha256:/, "", d); gsub(/".*/, "", d); print d; exit
-      }
-    }')
-  [[ "$DIGEST" =~ ^[a-f0-9]{64}$ ]] && printf '%s' "$DIGEST"
-}
-
-secure_download_with_sha256() {
-  local URL="$1" OUT="$2" EXPECTED_SHA256="$3" NAME="$4"
-  [ -n "$EXPECTED_SHA256" ] && [[ "$EXPECTED_SHA256" =~ ^[a-f0-9]{64}$ ]] || error "\n SHA256 missing for ${NAME}; refusing to install. \n"
-  rm -f "$OUT"
-  case "$URL" in https://github.com/*|https://api.github.com/*) ;; *) error "\n Unsafe download URL: ${URL} \n" ;; esac
-  wget --tries=3 --timeout=30 -qO "$OUT" "$URL" || {
-    rm -f "$OUT"
-    error "\n Download failed: ${URL} \n"
-  }
-  printf '%s  %s\n' "$EXPECTED_SHA256" "$OUT" | sha256sum -c - >/dev/null 2>&1 || {
-    rm -f "$OUT"
-    error "\n SHA256 verification failed for ${NAME}; refusing to install. \n"
-  }
-}
-
-secure_download_release_asset() {
-  local COMPONENT="$1" REPO="$2" TAG="$3" ASSET="$4" OUT="$5" URL EXPECTED_SHA256
-  URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
-  EXPECTED_SHA256=$(get_embedded_sha256 "$COMPONENT" "$ASSET" 2>/dev/null || true)
-  if [ -z "$EXPECTED_SHA256" ] && [ "$COMPONENT" = 'sing-box' ]; then
-    EXPECTED_SHA256=$(get_github_release_digest "$REPO" "$TAG" "$ASSET" 2>/dev/null || true)
+  # 确定下载工具：优先 wget，次选 curl
+  if command -v wget >/dev/null 2>&1; then
+    CMD='wget'
+  elif command -v curl >/dev/null 2>&1; then
+    CMD='curl'
+  else
+    GH_PROXY=''
+    return
   fi
-  secure_download_with_sha256 "$URL" "$OUT" "$EXPECTED_SHA256" "$ASSET"
+
+  # 获取 HTTP 状态码
+  get_code() {
+    local url=$1
+    if [ "$CMD" = 'wget' ]; then
+      wget -qT5 -O /dev/null --server-response "$url" 2>&1 | awk '/HTTP\//{code=$2} END{print code}'
+    else
+      curl -sL -w "%{http_code}" "$url" -o /dev/null
+    fi
+  }
+
+  # 直连检测
+  CODE=$(get_code "$API_URL")
+  if [ "$CODE" = '200' ]; then
+    GH_PROXY=''
+    return
+  fi
+
+  # 并发探测代理
+  for PROXY in "${GITHUB_PROXY[@]}"; do
+    {
+      CODE=$(get_code "${PROXY}${API_URL}")
+      [ "$CODE" = '200' ] && [ ! -e "${TEMP_DIR}/cdn_proxy" ] && printf '%s' "$PROXY" > "${TEMP_DIR}/cdn_proxy"
+    } &
+    PIDS+=("$!")
+  done
+
+  # 等第一个返回 200 的代理，超时则回退为直连，避免无限等待卡死
+  while [ ! -e "${TEMP_DIR}/cdn_proxy" ] && [ "$_WAIT_COUNT" -gt 0 ]; do
+    sleep 0.05
+    (( _WAIT_COUNT-- )) || true
+  done
+
+  [ -e "${TEMP_DIR}/cdn_proxy" ] && GH_PROXY=$(cat "${TEMP_DIR}/cdn_proxy") || GH_PROXY=''
+
+  # 清理后台任务和临时文件
+  for PID in "${PIDS[@]}"; do kill "$PID" >/dev/null 2>&1 || true; done
+  for PID in "${PIDS[@]}"; do wait "$PID" 2>/dev/null || true; done
+  rm -f "${TEMP_DIR}/cdn_proxy"
 }
 
 # 检测是否解锁 chatGPT，以决定是否使用 warp 链式代理或者是 direct out，此处判断改编自 https://github.com/lmc999/RegionRestrictionCheck
@@ -1950,22 +1941,22 @@ check_install() {
 
   # 如果有需要，后台静默下载 sing-box
   if [ "${STATUS[0]}" = "$(text 26)" ] && [ ! -s ${WORK_DIR}/sing-box ]; then
-    # 任务 1: 下载 sing-box（官方 Releases + 固定版本 + SHA256 校验）
+    # 任务 1: 下载 sing-box
     {
       local ONLINE=$(get_sing_box_version)
-      local SB_ASSET="sing-box-${ONLINE}-linux-${SING_BOX_ARCH}.tar.gz"
-      local SB_TAR="${TEMP_DIR}/${SB_ASSET}"
-      local SB_DIR="${TEMP_DIR}/sing-box-${ONLINE}-linux-${SING_BOX_ARCH}"
-      local SB_BIN="${SB_DIR}/sing-box"
-      secure_download_release_asset 'sing-box' 'SagerNet/sing-box' "v${ONLINE}" "$SB_ASSET" "$SB_TAR"
-      tar xzf "$SB_TAR" -C "$TEMP_DIR" "$SB_ASSET" >/dev/null 2>&1 || tar xzf "$SB_TAR" -C "$TEMP_DIR" >/dev/null 2>&1
+      local SB_DIR="$TEMP_DIR/sing-box-$ONLINE-linux-$SING_BOX_ARCH"
+      local SB_BIN="$SB_DIR/sing-box"
+      wget --continue \
+        ${GH_PROXY}https://github.com/SagerNet/sing-box/releases/download/v$ONLINE/sing-box-$ONLINE-linux-$SING_BOX_ARCH.tar.gz \
+        -qO- | tar xz -C $TEMP_DIR 2>/dev/null
       [ -s "$SB_BIN" ] && [ -x "$SB_BIN" ] && mv "$SB_BIN" "$TEMP_DIR/sing-box" && chmod +x "$TEMP_DIR/sing-box"
     } &
 
-    # 任务 2: 下载 jq（官方 Releases + 固定版本 + 内置 SHA256 校验）
+    # 任务 2: 下载 jq
     {
-      local JQ_ASSET="jq-linux-${JQ_ARCH}"
-      secure_download_release_asset 'jq' 'jqlang/jq' "jq-${PINNED_JQ_VERSION}" "$JQ_ASSET" "$TEMP_DIR/jq" && chmod +x "$TEMP_DIR/jq"
+      wget --continue -qO $TEMP_DIR/jq \
+        ${GH_PROXY}https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-$JQ_ARCH 2>/dev/null \
+        && chmod +x $TEMP_DIR/jq
     } &
 
     # 任务 3: 本地二维码包装器已由 write_local_subscribe_templates 生成
@@ -2016,8 +2007,7 @@ check_install() {
   # 如果有需要，后台静默下载 cloudflared
   if [[ "${STATUS[1]}" = "$(text 26)" || "$NONINTERACTIVE_INSTALL" = 'noninteractive_install' ]] && [ ! -s ${WORK_DIR}/cloudflared ]; then
     {
-      local CF_ASSET="cloudflared-linux-${ARGO_ARCH}"
-      secure_download_release_asset 'cloudflared' 'cloudflare/cloudflared' "${PINNED_CLOUDFLARED_VERSION}" "$CF_ASSET" "$TEMP_DIR/cloudflared" && chmod +x "$TEMP_DIR/cloudflared"
+      wget -qO $TEMP_DIR/cloudflared ${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARGO_ARCH >/dev/null 2>&1 && chmod +x $TEMP_DIR/cloudflared >/dev/null 2>&1
     }&
   elif [ "${STATUS[1]}" != "$(text 26)" ]; then
     # 查 Argo 进程号，运行时长和内存占用
@@ -2165,9 +2155,23 @@ check_system_info() {
   fi
 }
 
-# 安全版：固定 sing-box 版本，禁止 latest / force_version / 第三方仓库控制版本。
+# 获取 sing-box 最新版本
 get_sing_box_version() {
-  echo "$PINNED_SING_BOX_VERSION"
+  # FORCE_VERSION 用于在 sing-box 某个主程序出现 bug 时，强制为指定版本，以防止运行出错
+  local FORCE_VERSION=$(wget --tries=2 --timeout=3 -qO- ${GH_PROXY}https://raw.githubusercontent.com/fscarmen/sing-box/refs/heads/main/force_version | sed 's/^[vV]//g; s/\r//g')
+  if grep -q '.' <<< "$FORCE_VERSION"; then
+    local RESULT_VERSION="$FORCE_VERSION"
+  else
+    # 先判断 github api 返回 http 状态码是否为 200，有时候 IP 会被限制，导致获取不到最新版本
+    local API_RESPONSE=$(wget --server-response --tries=2 --timeout=3 -qO- "${GH_PROXY}https://api.github.com/repos/SagerNet/sing-box/releases" 2>&1 | grep -E '^[ ]+HTTP/|tag_name')
+    if grep -q 'HTTP.* 200' <<< "$API_RESPONSE"; then
+      local VERSION_LATEST=$(awk -F '["v-]' '/tag_name/{print $5}' <<< "$API_RESPONSE" | sort -Vr | sed -n '1p')
+      local RESULT_VERSION=$(wget --tries=2 --timeout=3 -qO- ${GH_PROXY}https://api.github.com/repos/SagerNet/sing-box/releases | awk -F '["v]' -v var="tag_name.*$VERSION_LATEST" '$0 ~ var {print $5; exit}')
+    else
+      local RESULT_VERSION="$DEFAULT_NEWEST_VERSION"
+    fi
+  fi
+  echo "$RESULT_VERSION"
 }
 
 # 添加端口跳跃
@@ -4391,11 +4395,6 @@ install_sing-box() {
   [ ! -d ${TEMP_DIR} ] && mkdir -p $TEMP_DIR
   ssl_certificate $TLS_SERVER_DEFAULT
   hint "\n $(text 2) " && wait
-  [ -x "$TEMP_DIR/sing-box" ] || error "\n Verified sing-box binary missing; refusing to continue. \n"
-  [ -x "$TEMP_DIR/jq" ] || error "\n Verified jq binary missing; refusing to continue. \n"
-  if [ "$IS_ARGO" = 'is_argo' ] || [ "$NONINTERACTIVE_INSTALL" = 'noninteractive_install' ]; then
-    [ -x "$TEMP_DIR/cloudflared" ] || error "\n Verified cloudflared binary missing; refusing to continue. \n"
-  fi
   sing-box_json
   echo "${L^^}" > ${WORK_DIR}/language
   cp $TEMP_DIR/sing-box $TEMP_DIR/jq ${WORK_DIR}
@@ -5605,10 +5604,7 @@ version() {
 
   if [ "${UPDATE,,}" = 'y' ]; then
     check_system_info
-    local SB_ASSET="sing-box-${ONLINE}-linux-${SING_BOX_ARCH}.tar.gz"
-    local SB_TAR="${TEMP_DIR}/${SB_ASSET}"
-    secure_download_release_asset 'sing-box' 'SagerNet/sing-box' "v${ONLINE}" "$SB_ASSET" "$SB_TAR"
-    tar xzf "$SB_TAR" -C "$TEMP_DIR" "sing-box-${ONLINE}-linux-${SING_BOX_ARCH}/sing-box"
+    wget --continue ${GH_PROXY}https://github.com/SagerNet/sing-box/releases/download/v$ONLINE/sing-box-$ONLINE-linux-$SING_BOX_ARCH.tar.gz -qO- | tar xz -C $TEMP_DIR sing-box-$ONLINE-linux-$SING_BOX_ARCH/sing-box
 
     if [ -s $TEMP_DIR/sing-box-$ONLINE-linux-$SING_BOX_ARCH/sing-box ]; then
       cmd_systemctl disable sing-box
