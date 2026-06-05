@@ -3,7 +3,6 @@
 # 当前脚本版本号
 VERSION='v1.3.14-safe2-production (2026.06.05, official-sha256-local-rules)'
 
-# Github 反代加速代理
 GITHUB_PROXY=()
 
 # 各变量默认值
